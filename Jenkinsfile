@@ -1,7 +1,12 @@
 
-
 pipeline {
     agent any
+
+    options {
+        skipDefaultCheckout(true)
+        timestamps()
+        disableConcurrentBuilds()
+    }
 
     environment {
         AWS_REGION = 'eu-north-1'
@@ -12,9 +17,12 @@ pipeline {
         FRONTEND_REPO = 'supermarket-frontend'
         BACKEND_REPO = 'supermarket-backend'
 
-        // Replace with your deployment EC2 public IP
-        DEPLOY_HOST = '16.192.57.225'
-        DEPLOY_USER = 'ubuntu'
+        FRONTEND_IMAGE = "${ECR_REGISTRY}/${FRONTEND_REPO}"
+        BACKEND_IMAGE = "${ECR_REGISTRY}/${BACKEND_REPO}"
+
+        DOCKER_NETWORK = 'freshmart-net'
+        FRONTEND_CONTAINER = 'freshmart-frontend'
+        BACKEND_CONTAINER = 'freshmart-backend'
     }
 
     stages {
@@ -22,7 +30,26 @@ pipeline {
         stage('Checkout') {
             steps {
                 checkout scm
-                echo 'GitHub source code checked out successfully'
+
+                echo 'GitHub source code downloaded successfully!'
+            }
+        }
+
+        stage('Verify Files') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Checking project files..."
+
+                    test -f Dockerfile.frontend
+                    test -f nginx/default.conf
+                    test -f backend/Dockerfile
+                    test -f backend/package.json
+                    test -f backend/server.js
+
+                    echo "All required files are present!"
+                '''
             }
         }
 
@@ -30,9 +57,12 @@ pipeline {
             steps {
                 sh '''
                     docker build \
-                      -f Dockerfile.frontend \
-                      -t $ECR_REGISTRY/$FRONTEND_REPO:$BUILD_NUMBER .
+                        -f Dockerfile.frontend \
+                        -t ${FRONTEND_IMAGE}:${BUILD_NUMBER} \
+                        .
                 '''
+
+                echo 'Frontend Docker image built successfully!'
             }
         }
 
@@ -40,9 +70,12 @@ pipeline {
             steps {
                 sh '''
                     docker build \
-                      -f backend/Dockerfile \
-                      -t $ECR_REGISTRY/$BACKEND_REPO:$BUILD_NUMBER backend
+                        -f backend/Dockerfile \
+                        -t ${BACKEND_IMAGE}:${BUILD_NUMBER} \
+                        backend
                 '''
+
+                echo 'Backend Docker image built successfully!'
             }
         }
 
@@ -50,99 +83,152 @@ pipeline {
             steps {
                 sh '''
                     aws ecr get-login-password \
-                      --region $AWS_REGION | \
+                        --region ${AWS_REGION} | \
                     docker login \
-                      --username AWS \
-                      --password-stdin $ECR_REGISTRY
+                        --username AWS \
+                        --password-stdin ${ECR_REGISTRY}
                 '''
+
+                echo 'AWS ECR login successful!'
             }
         }
 
         stage('Push Frontend Image') {
             steps {
                 sh '''
-                    docker push \
-                      $ECR_REGISTRY/$FRONTEND_REPO:$BUILD_NUMBER
+                    docker push ${FRONTEND_IMAGE}:${BUILD_NUMBER}
                 '''
+
+                echo 'Frontend image pushed to AWS ECR!'
             }
         }
 
         stage('Push Backend Image') {
             steps {
                 sh '''
-                    docker push \
-                      $ECR_REGISTRY/$BACKEND_REPO:$BUILD_NUMBER
+                    docker push ${BACKEND_IMAGE}:${BUILD_NUMBER}
+                '''
+
+                echo 'Backend image pushed to AWS ECR!'
+            }
+        }
+
+        stage('Prepare Docker Network') {
+            steps {
+                sh '''
+                    docker network inspect ${DOCKER_NETWORK} \
+                        >/dev/null 2>&1 || \
+                    docker network create ${DOCKER_NETWORK}
+                '''
+
+                echo 'Docker network is ready!'
+            }
+        }
+
+        stage('Deploy Backend') {
+            steps {
+                sh '''
+                    set -e
+
+                    if [ ! -f /opt/freshmart/backend.env ]; then
+                        echo "ERROR: Backend environment file not found!"
+                        exit 1
+                    fi
+
+                    docker rm -f ${BACKEND_CONTAINER} || true
+
+                    docker run -d \
+                        --name ${BACKEND_CONTAINER} \
+                        --restart unless-stopped \
+                        --network ${DOCKER_NETWORK} \
+                        --env-file /opt/freshmart/backend.env \
+                        ${BACKEND_IMAGE}:${BUILD_NUMBER}
+
+                    echo "Backend container started!"
                 '''
             }
         }
 
-        stage('Deploy to EC2') {
+        stage('Deploy Frontend') {
             steps {
-                sshagent(credentials: ['freshmart-deploy-key']) {
-                    sh '''
-                        ssh -o StrictHostKeyChecking=accept-new \
-                          $DEPLOY_USER@$DEPLOY_HOST \
-                          "AWS_REGION='$AWS_REGION' \
-                           ECR_REGISTRY='$ECR_REGISTRY' \
-                           FRONTEND_IMAGE='$ECR_REGISTRY/$FRONTEND_REPO:$BUILD_NUMBER' \
-                           BACKEND_IMAGE='$ECR_REGISTRY/$BACKEND_REPO:$BUILD_NUMBER' \
-                           bash -s" <<'REMOTE'
+                sh '''
+                    set -e
 
-                        set -e
+                    docker rm -f ${FRONTEND_CONTAINER} || true
 
-                        if [ ! -f /opt/freshmart/backend.env ]; then
-                            echo "Backend environment file missing!"
-                            exit 1
+                    docker run -d \
+                        --name ${FRONTEND_CONTAINER} \
+                        --restart unless-stopped \
+                        --network ${DOCKER_NETWORK} \
+                        -p 80:80 \
+                        ${FRONTEND_IMAGE}:${BUILD_NUMBER}
+
+                    echo "Frontend container started!"
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Checking running containers..."
+
+                    docker ps
+
+                    docker inspect -f '{{.State.Status}}' \
+                        ${BACKEND_CONTAINER}
+
+                    docker inspect -f '{{.State.Status}}' \
+                        ${FRONTEND_CONTAINER}
+
+                    echo "Checking frontend HTTP response..."
+
+                    for i in $(seq 1 15); do
+                        if curl -fsS http://localhost/ >/dev/null; then
+                            echo "Frontend is responding successfully!"
+                            exit 0
                         fi
 
-                        aws ecr get-login-password \
-                          --region "$AWS_REGION" | \
-                        sudo docker login \
-                          --username AWS \
-                          --password-stdin "$ECR_REGISTRY"
+                        sleep 2
+                    done
 
-                        sudo docker network create freshmart-net \
-                          2>/dev/null || true
-
-                        sudo docker pull "$BACKEND_IMAGE"
-                        sudo docker pull "$FRONTEND_IMAGE"
-
-                        sudo docker rm -f freshmart-frontend \
-                          2>/dev/null || true
-
-                        sudo docker rm -f freshmart-backend \
-                          2>/dev/null || true
-
-                        sudo docker run -d \
-                          --name freshmart-backend \
-                          --restart unless-stopped \
-                          --network freshmart-net \
-                          --env-file /opt/freshmart/backend.env \
-                          "$BACKEND_IMAGE"
-
-                        sudo docker run -d \
-                          --name freshmart-frontend \
-                          --restart unless-stopped \
-                          --network freshmart-net \
-                          -p 80:80 \
-                          "$FRONTEND_IMAGE"
-
-                        sudo docker ps
-
-                        REMOTE
-                    '''
-                }
+                    echo "ERROR: Frontend health check failed!"
+                    exit 1
+                '''
             }
         }
     }
 
     post {
         success {
-            echo 'FreshMart CI/CD deployment successful!'
+            echo '''
+            =========================================
+               FRESHMART DEPLOYMENT SUCCESSFUL!
+            =========================================
+
+            Frontend: http://16.192.57.225
+            Jenkins:  http://16.192.57.225:8080
+
+            Both Docker images pushed to AWS ECR.
+            Both application containers deployed.
+            '''
         }
 
         failure {
-            echo 'FreshMart pipeline failed. Check Jenkins Console Output.'
+            echo '''
+            =========================================
+               FRESHMART PIPELINE FAILED!
+            =========================================
+
+            Check the Jenkins Console Output
+            to identify the failed stage.
+            '''
+        }
+
+        always {
+            echo 'FreshMart CI/CD pipeline execution completed.'
         }
     }
 }
