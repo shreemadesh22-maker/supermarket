@@ -13,7 +13,7 @@ pipeline {
         BACKEND_REPO = 'supermarket-backend'
 
         // Replace with your deployment EC2 public IP
-        DEPLOY_HOST = 'YOUR_DEPLOYMENT_EC2_PUBLIC_IP'
+        DEPLOY_HOST = '16.192.57.225'
         DEPLOY_USER = 'ubuntu'
     }
 
